@@ -1,0 +1,122 @@
+---
+- hosts: all
+  become: true
+  tasks:
+    - name: Install packages that allow apt to be used over HTTPS
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+
+    - name: Add an apt signing key for Docker
+      apt_key:
+        url: https://download.docker.com/linux/debian/gpg
+        state: present
+
+    - name: Add apt repository for stable version
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/debian buster stable
+        state: present
+
+    - name: Install docker and its dependecies
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+      notify:
+        - docker status
+
+    - name: Copy daemon docker configuration
+      copy: src=daemon.json dest=/etc/docker/daemon.json
+      register: docker_daemon
+
+    - name: Restart docker
+      service:
+        name: docker
+        daemon_reload: yes
+        state: restarted
+      when: docker_daemon.changed
+
+    - name: Add an apt signing key for Kubernetes
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Adding apt repository for Kubernetes
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+        filename: kubernetes.list
+
+    - name: Install Kubernetes binaries
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - kubelet
+          - kubeadm
+          - kubectl
+
+    - name: Configure node ip and cgroup driver
+      lineinfile:
+        path: /etc/default/kubelet
+        line: KUBELET_EXTRA_ARGS=--node-ip={{ ansible_eth0.ipv4.address }} --cgroup-driver=systemd
+        create: yes
+      register: kubelet_daemon
+
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        daemon_reload: yes
+        state: restarted
+      when: kubelet_daemon.changed
+
+    - name: Initialize the Kubernetes cluster using kubeadm
+      command: kubeadm init --node-name {{ ansible_hostname }} --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ ansible_eth0.ipv4.address }}
+
+    - name: Create a ~/.kube directory if it does not exist
+      ansible.builtin.file:
+        path: ~/.kube
+        state: directory
+        mode: '0755'
+        owner: azureuser
+        group: azureuser
+
+    - name: Copy admin kubeconfig to user path
+      copy: src=/etc/kubernetes/admin.conf dest=~/.kube/config remote_src=yes
+
+    - name: Install calico networking
+      become: false
+      command: kubectl create -f https://docs.projectcalico.org/manifests/calico.yaml
+
+    - name: Generate join command
+      command: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Copy join command to local file
+      become: false
+      local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join-command"
+
+    - name: Fetch kubeconfig to local
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: kubeconfig
+        flat: yes
+
+  handlers:
+    - name: docker status
+      service: name=docker state=started
